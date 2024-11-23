@@ -50,7 +50,7 @@ def process_single_image(img):
     img = img[:, :, ::-1]  # Convert RGB to BGR (OpenCV format)
 
     # Define padding around the face in pixels
-    padding = 20  # Adjust as needed for better cropping
+    padding = 50  # Adjust as needed for better cropping
 
     # Convert to grayscale for face detection
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
