@@ -1,10 +1,13 @@
 import streamlit as st
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from torchvision import transforms
+from timm.models import xception
 from PIL import Image
 import numpy as np
 from skimage.feature import local_binary_pattern
-import torch.nn.functional as F
+import cv2  # Add this import for OpenCV functions
 
 # Other Files
 from model import Xception_SingleCAM
@@ -16,17 +19,18 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 @st.cache_resource
 def load_model():
     model = Xception_SingleCAM(pretrained=False, num_classes=2)
-    model.load_state_dict(torch.load("best_model_epoch_12.pth", map_location=torch.device('cpu')))
+    model.load_state_dict(torch.load("best_model_epoch_12.pth", map_location=device))
     model.eval()  # Set the model to evaluation mode
     return model
 
 # Initialize the model
 model = load_model()
+model = model.to(device)  # Move model to device
 
 # Streamlit app logic
-st.title("Deepfake Detection app")
+st.title("Deepfake Detection App")
 st.sidebar.title("About")
-st.sidebar.info("This app uses a PyTorch model to classify images.")
+st.sidebar.info("This app uses a PyTorch model to classify images and visualize activations using Grad-CAM and saliency mapping.")
 
 # Preprocessing function (convert to tensor and normalize)
 def preprocess_image(image, grayscale=False):
@@ -39,7 +43,7 @@ def preprocess_image(image, grayscale=False):
         transforms.Grayscale() if grayscale else transforms.Lambda(lambda x: x),  # Convert to grayscale if needed
         transforms.Resize((224, 224)),  # Resize to model's expected input size
         transforms.ToTensor(),  # Convert to PyTorch tensor
-        transforms.Normalize(mean=[0.485, 0.456, 0.406] if not grayscale else [0.5], 
+        transforms.Normalize(mean=[0.485, 0.456, 0.406] if not grayscale else [0.5],
                              std=[0.229, 0.224, 0.225] if not grayscale else [0.5])
     ])
     return transform(image)
@@ -68,6 +72,106 @@ def predict(rgb_image, freq_image, lbp_image):
     with torch.no_grad():
         outputs = model(combined_images)
     return outputs
+
+# Grad-CAM function
+def compute_gradcam(model, rgb_image, freq_image, lbp_image, target_class):
+    # Preprocess images
+    rgb_image_tensor = preprocess_image(rgb_image)
+    freq_image_tensor = preprocess_image(freq_image, grayscale=True)
+    lbp_image_tensor = preprocess_image(lbp_image, grayscale=True)
+
+    # Add batch dimension
+    rgb_image_tensor = rgb_image_tensor.unsqueeze(0).to(device).requires_grad_(True)
+    freq_image_tensor = freq_image_tensor.unsqueeze(0).to(device)
+    lbp_image_tensor = lbp_image_tensor.unsqueeze(0).to(device)
+
+    # Concatenate images
+    combined_images = torch.cat((rgb_image_tensor, freq_image_tensor, lbp_image_tensor), dim=1)
+
+    activations = {}
+    gradients = {}
+
+    def forward_hook(module, input, output):
+        activations['value'] = output.detach()
+
+    def backward_hook(module, grad_in, grad_out):
+        gradients['value'] = grad_out[0].detach()
+
+    # Register hooks
+    handle_forward = model.channel_attention.register_forward_hook(forward_hook)
+    handle_backward = model.channel_attention.register_backward_hook(backward_hook)
+
+    # Forward pass
+    outputs = model(combined_images)
+    score = outputs[0, target_class]
+
+    # Backward pass
+    model.zero_grad()
+    score.backward()
+
+    # Remove hooks
+    handle_forward.remove()
+    handle_backward.remove()
+
+    # Get activations and gradients
+    grads_val = gradients['value']  # [batch_size, num_channels, h, w]
+    activations_val = activations['value']  # [batch_size, num_channels, h, w]
+
+    # Compute weights
+    weights = torch.mean(grads_val, dim=(2, 3), keepdim=True)  # Global average pooling
+
+    # Compute Grad-CAM
+    gradcam_map = torch.sum(weights * activations_val, dim=1, keepdim=True)
+    gradcam_map = F.relu(gradcam_map)
+
+    # Normalize and resize
+    gradcam_map = F.interpolate(gradcam_map, size=(224, 224), mode='bilinear', align_corners=False)
+    gradcam_map = gradcam_map.squeeze().cpu().numpy()
+    gradcam_map = (gradcam_map - gradcam_map.min()) / (gradcam_map.max() - gradcam_map.min() + 1e-8)
+
+    # Prepare original image
+    rgb_image_np = rgb_image_tensor.squeeze().cpu().detach().numpy().transpose(1, 2, 0)
+
+    rgb_image_np = np.clip(rgb_image_np * [0.229, 0.224, 0.225] + [0.485, 0.456, 0.406], 0, 1)
+
+    # Overlay Grad-CAM on image
+    heatmap = cv2.applyColorMap(np.uint8(255 * gradcam_map), cv2.COLORMAP_JET)
+    heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
+    overlay = heatmap.astype(np.float32) / 255 + rgb_image_np
+    overlay = overlay / np.max(overlay)
+
+    return overlay
+
+# Saliency Map function
+def compute_saliency_map(model, rgb_image, freq_image, lbp_image, target_class):
+    # Preprocess images
+    rgb_image_tensor = preprocess_image(rgb_image)
+    freq_image_tensor = preprocess_image(freq_image, grayscale=True)
+    lbp_image_tensor = preprocess_image(lbp_image, grayscale=True)
+
+    # Add batch dimension
+    rgb_image_tensor = rgb_image_tensor.unsqueeze(0).to(device).requires_grad_(True)
+    freq_image_tensor = freq_image_tensor.unsqueeze(0).to(device)
+    lbp_image_tensor = lbp_image_tensor.unsqueeze(0).to(device)
+
+    # Concatenate images
+    combined_images = torch.cat((rgb_image_tensor, freq_image_tensor, lbp_image_tensor), dim=1)
+
+    # Forward pass
+    outputs = model(combined_images)
+    score = outputs[0, target_class]
+
+    # Backward pass
+    model.zero_grad()
+    score.backward()
+
+    # Compute saliency map
+    saliency = rgb_image_tensor.grad.data.abs()
+    saliency, _ = torch.max(saliency, dim=1)
+    saliency = saliency.squeeze().cpu().numpy()
+    saliency = (saliency - saliency.min()) / (saliency.max() - saliency.min() + 1e-8)
+
+    return saliency
 
 # Image Uploader
 uploaded_file = st.file_uploader("Upload an image", type=["jpg", "png", "jpeg"])
@@ -105,45 +209,42 @@ if uploaded_file is not None:
         with col4:
             st.image(freq_image, caption="Frequency Spectrum", use_column_width=True)
 
-            
+        # Make predictions
+        predictions = predict(face_crop_pil, freq_image, lbp_image)
+
+        # Define class labels
+        class_labels = ["FAKE", "REAL"]
+
+        # Apply softmax to get probabilities (for multi-class classification)
+        probabilities = F.softmax(predictions, dim=1)
+
+        # Convert tensor to NumPy for easier handling
+        probabilities_np = probabilities.cpu().detach().numpy()
+
+        # Find the predicted class
+        predicted_class = torch.argmax(probabilities, dim=1).item()
+
+        # Display results
+        st.write("Predictions (Probabilities):", probabilities_np)
+        st.write("Predicted Class:", class_labels[predicted_class])
+
+        # Compute Grad-CAM
+        gradcam_result = compute_gradcam(model, face_crop_pil, freq_image, lbp_image, predicted_class)
+
+        # Compute Saliency Map
+        saliency_result = compute_saliency_map(model, face_crop_pil, freq_image, lbp_image, predicted_class)
+
+        # Display Grad-CAM and Saliency Map
+        st.subheader("Model Visualization")
+        col5, col6 = st.columns(2)
+
+        with col5:
+            st.image(gradcam_result, caption="Grad-CAM", use_column_width=True)
+
+        with col6:
+            st.image(saliency_result, caption="Saliency Map", use_column_width=True)
+
     else:
         st.warning("No face detected in the uploaded image.")
-
-
-    # Preprocess Image for deepfake detection model
-    transform = transforms.Compose([
-        transforms.Resize((224, 224)),  # Adjust to match your model input size
-        transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])  # Standard normalization
-    ])
-
-    # Make predictions
-    predictions = predict(face_crop_pil, freq_image, lbp_image)
-
-    # Define class labels
-    class_labels = ["FAKE", "REAL"]
-
-    # Apply softmax to get probabilities (for multi-class classification)
-    probabilities = F.softmax(predictions, dim=1)
-
-    # Apply sigmoid (for binary classification, if logits have one output per class)
-    # probabilities = torch.sigmoid(predictions)
-
-    # Convert tensor to NumPy for easier handling
-    probabilities_np = probabilities.cpu().detach().numpy()
-
-    # Find the predicted class
-    predicted_class = torch.argmax(probabilities, dim=1).item()
-
-    # Display results
-    st.write("Predictions (Probabilities):", probabilities_np)
-    st.write("Predicted Class:", class_labels[predicted_class])
-
-
-
-
-
-
-
 
 st.sidebar.text("Developed with ❤️ using Streamlit.")
