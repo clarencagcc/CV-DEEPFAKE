@@ -167,11 +167,33 @@ def compute_saliency_map(model, rgb_image, freq_image, lbp_image, target_class):
 
     # Compute saliency map
     saliency = rgb_image_tensor.grad.data.abs()
-    saliency, _ = torch.max(saliency, dim=1)
-    saliency = saliency.squeeze().cpu().numpy()
+    saliency, _ = torch.max(saliency, dim=1)  # Take the maximum over the color channels
+    saliency = saliency.squeeze().cpu().detach().numpy()
+
+    # Normalize the saliency map
     saliency = (saliency - saliency.min()) / (saliency.max() - saliency.min() + 1e-8)
 
-    return saliency
+    # Enhance the saliency map by applying a power law (gamma correction)
+    saliency = np.power(saliency, 0.5)  # Adjust gamma as needed to brighten the image
+
+    # Convert saliency map to 0-255 and apply color map
+    saliency = np.uint8(255 * saliency)
+    saliency_color = cv2.applyColorMap(saliency, cv2.COLORMAP_JET)
+    saliency_color = cv2.cvtColor(saliency_color, cv2.COLOR_BGR2RGB)
+    saliency_color = saliency_color.astype(np.float32) / 255
+
+    # Prepare original image
+    rgb_image_np = rgb_image_tensor.squeeze().cpu().detach().numpy().transpose(1, 2, 0)
+    rgb_image_np = np.clip(
+        rgb_image_np * [0.229, 0.224, 0.225] + [0.485, 0.456, 0.406], 0, 1
+    )
+
+    # Overlay saliency map on the original image
+    overlay = 0.6 * saliency_color + 0.4 * rgb_image_np  # Adjust weights as needed
+    overlay = overlay / np.max(overlay)
+
+    return overlay
+
 
 # Image Uploader
 uploaded_file = st.file_uploader("Upload an image", type=["jpg", "png", "jpeg"])
