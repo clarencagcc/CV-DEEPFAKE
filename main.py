@@ -2,6 +2,7 @@ import streamlit as st
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import time
 from torchvision import transforms
 from timm.models import xception
 from PIL import Image
@@ -69,9 +70,17 @@ def predict(rgb_image, freq_image, lbp_image):
     combined_images = torch.cat((rgb_image, freq_image, lbp_image), dim=1)  # dim=1 is the channel dimension
 
     # Forward pass through the model
-    with torch.no_grad():
-        outputs = model(combined_images)
-    return outputs
+    with torch.no_grad():  # Disable gradient calculation for inference
+        start_time = time.time()  # Record the start time
+        
+        output = model(combined_images)  # Forward pass through the model
+        
+        end_time = time.time()  # Record the end time
+
+    # Calculate elapsed time
+    elapsed_time = end_time - start_time
+    print(f"Time required to process one test file: {elapsed_time:.4f} seconds")
+    return output
 
 # Grad-CAM function
 def compute_gradcam(model, rgb_image, freq_image, lbp_image, target_class):
